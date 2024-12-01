@@ -43,7 +43,8 @@
         "Wokwi.wokwi-vscode",
         "GitHub.copilot",
         "k--kato.intellij-idea-keybindings",
-        "vscodevim.vim"
+        "vscodevim.vim",
+        "ms-azuretools.vscode-docker"
       ]
     }
   },
