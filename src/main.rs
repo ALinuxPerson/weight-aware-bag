@@ -2,7 +2,6 @@ mod config {
     use anyhow::Context;
     use esp32_nimble::BLEAddress;
     use esp_idf_svc::nvs::{EspNvs, EspNvsPartition, NvsDefault};
-    use serde::Deserialize;
 
     const NAMESPACE: &str = "config";
 
@@ -18,23 +17,35 @@ mod config {
     }
 
     impl Config {
-        pub fn get_paired_id_address(nvs: &EspNvs<NvsDefault>) -> anyhow::Result<Option<BLEAddress>> {
+        pub fn get_paired_id_address(
+            nvs: &EspNvs<NvsDefault>,
+        ) -> anyhow::Result<Option<BLEAddress>> {
             let mut buf = [0u8; 6];
-            nvs.get_blob("paired_id_address", &mut buf).context("failed to get paired_id_address")?;
-            Ok(Some(BLEAddress::from_le_bytes(buf, esp32_nimble::BLEAddressType::PublicID)))
+            nvs.get_blob("paired_id_address", &mut buf)
+                .context("failed to get paired_id_address")?;
+            Ok(Some(BLEAddress::from_le_bytes(
+                buf,
+                esp32_nimble::BLEAddressType::PublicID,
+            )))
         }
 
-        pub fn set_paired_id_address(nvs: &mut EspNvs<NvsDefault>, address: BLEAddress) -> anyhow::Result<()> {
-            nvs.set_blob("paired_id_address", &address.as_le_bytes()).context("failed to set paired_id_address")
+        pub fn set_paired_id_address(
+            nvs: &mut EspNvs<NvsDefault>,
+            address: BLEAddress,
+        ) -> anyhow::Result<()> {
+            nvs.set_blob("paired_id_address", &address.as_le_bytes())
+                .context("failed to set paired_id_address")
         }
     }
 
     pub fn nvs() -> anyhow::Result<EspNvs<NvsDefault>> {
         log::info!("take the default esp nvs partition");
-        let default_partition = EspNvsPartition::<NvsDefault>::take().context("failed to take the default esp nvs partition")?;
+        let default_partition = EspNvsPartition::<NvsDefault>::take()
+            .context("failed to take the default esp nvs partition")?;
 
         log::info!("failed to create nvs instance");
-        let nvs = EspNvs::new(default_partition, NAMESPACE, true).context("failed to create nvs instance")?;
+        let nvs = EspNvs::new(default_partition, NAMESPACE, true)
+            .context("failed to create nvs instance")?;
 
         Ok(nvs)
     }
@@ -43,7 +54,10 @@ mod bluetooth {
     use std::sync::Arc;
 
     use anyhow::Context;
-    use esp32_nimble::{utilities::{mutex::Mutex, BleUuid}, uuid128, BLEAdvertisementData, BLEDevice, NimbleProperties};
+    use esp32_nimble::{
+        utilities::{mutex::Mutex, BleUuid},
+        uuid128, BLEAdvertisementData, BLECharacteristic, BLEDevice, NimbleProperties,
+    };
     use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 
     use crate::config::Config;
@@ -52,49 +66,91 @@ mod bluetooth {
     const SETUP_CHARACTERISTIC_UUID: BleUuid = uuid128!("3dc80940-699f-4666-8dc7-a150d328eb27");
     const DATA_CHARACTERISTIC_UUID: BleUuid = uuid128!("6b0d555e-d962-4219-89ae-d7c32efa7dcf");
 
-    pub fn initialize(nvs: Arc<Mutex<EspNvs<NvsDefault>>>) -> anyhow::Result<()> {
+    pub struct BluetoothCharacteristics {
+        pub setup: Arc<Mutex<BLECharacteristic>>,
+        pub data: Arc<Mutex<BLECharacteristic>>,
+    }
+
+    pub fn initialize(
+        nvs: Arc<Mutex<EspNvs<NvsDefault>>>,
+    ) -> anyhow::Result<BluetoothCharacteristics> {
         let device = BLEDevice::take();
-
-        let advertising = device.get_advertising();
-        advertising.lock()
-            .set_data(BLEAdvertisementData::new()
-            .name("Weight Aware Bag")
-            .add_service_uuid(SERVICE_UUID))
-            .context("failed to set ble advertising data")?;
-
         let server = device.get_server();
         let service = server.create_service(SERVICE_UUID);
-        let setup_characteristic = service.lock()
+        let setup_characteristic = service
+            .lock()
             .create_characteristic(SETUP_CHARACTERISTIC_UUID, NimbleProperties::WRITE);
-        let data_characteristic = service.lock()
-            .create_characteristic(DATA_CHARACTERISTIC_UUID, NimbleProperties::NOTIFY | NimbleProperties::READ);
+        let data_characteristic = service.lock().create_characteristic(
+            DATA_CHARACTERISTIC_UUID,
+            NimbleProperties::NOTIFY | NimbleProperties::READ,
+        );
 
-        server.on_connect(move |server, conn_desc| {
+        server.on_connect(move |server, desc| {
+            log::info!("new connection: {desc:?}");
+
             let paired = Config::get_paired_id_address(&nvs.lock());
             match paired {
-                Ok(Some(paired)) => if paired != conn_desc.id_address() {
-                    if let Err(error) = server.disconnect(conn_desc.conn_handle()) {
-                        log::error!("failed to disconnect unpaired device: {:?}", error);
+                Ok(Some(paired)) => {
+                    if paired != desc.id_address() {
+                        log::info!("connection is unrecognized, disconnecting");
+
+                        if let Err(error) = server.disconnect(desc.conn_handle()) {
+                            log::error!("failed to disconnect unpaired device: {error:?}");
+                            return;
+                        }
                     }
                 }
                 Ok(None) => {
-                    if let Err(error) = Config::set_paired_id_address(&mut nvs.lock(), conn_desc.id_address()) {
-                        log::error!("failed to set paired id address: {:?}", error);
+                    if let Err(error) =
+                        Config::set_paired_id_address(&mut nvs.lock(), desc.id_address())
+                    {
+                        log::error!("failed to set paired id address: {:?}");
                     }
+
+                    log::info!("paired with device: {desc:?}");
                 }
-                Err(error) => log::error!("failed to get paired id address: {:?}", error),
+                Err(error) => {
+                    log::error!("failed to get paired id address: {error:?}");
+                    return;
+                }
             }
 
+            if let Err(error) = server.update_conn_params(desc.conn_handle(), 24, 48, 0, 60) {
+                log::error!("failed to update connection parameters: {error:?}");
+            }
         });
 
-        Ok(())
+        server.on_disconnect(move |desc, reason| {
+            log::info!("client {desc:?} disconnected with reason {reason:?}");
+        });
+
+        log::info!("starting ble advertising");
+        let advertising = device.get_advertising();
+        advertising
+            .lock()
+            .set_data(
+                BLEAdvertisementData::new()
+                    .name("Weight Aware Bag")
+                    .add_service_uuid(SERVICE_UUID),
+            )
+            .context("failed to set ble advertising data")?;
+
+        server.ble_gatts_show_local();
+
+        Ok(BluetoothCharacteristics {
+            setup: setup_characteristic,
+            data: data_characteristic,
+        })
     }
 }
 
 use anyhow::Context;
 use esp32_nimble::utilities::mutex::Mutex;
+use esp_idf_svc::{
+    hal::prelude::Peripherals,
+    nvs::{EspNvs, EspNvsPartition, NvsDefault},
+};
 use std::sync::Arc;
-use esp_idf_svc::{hal::prelude::Peripherals, nvs::{EspNvs, EspNvsPartition, NvsDefault}};
 
 fn main() -> anyhow::Result<()> {
     // It is necessary to call this function once. Otherwise some patches to the runtime
@@ -107,6 +163,9 @@ fn main() -> anyhow::Result<()> {
     log::info!("initializing nvs flash storage");
     let nvs = config::nvs().context("failed to initialize nvs flash storage")?;
     let nvs = Arc::new(Mutex::new(nvs));
+
+    log::info!("initializing bluetooth");
+    let characteristics = bluetooth::initialize(nvs).context("failed to initialize bluetooth")?;
 
     Ok(())
 }
