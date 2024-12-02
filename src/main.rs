@@ -104,7 +104,7 @@ mod bluetooth {
                     if let Err(error) =
                         Config::set_paired_id_address(&mut nvs.lock(), desc.id_address())
                     {
-                        log::error!("failed to set paired id address: {:?}");
+                        log::error!("failed to set paired id address: {error:?}");
                     }
 
                     log::info!("paired with device: {desc:?}");
