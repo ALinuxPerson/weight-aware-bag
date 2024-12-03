@@ -17,7 +17,7 @@ mod config {
     }
 
     impl Config {
-        pub fn get_paired_id_address(
+        pub fn read_paired_id_address(
             nvs: &EspNvs<NvsDefault>,
         ) -> anyhow::Result<Option<BLEAddress>> {
             let mut buf = [0u8; 6];
@@ -29,12 +29,28 @@ mod config {
             )))
         }
 
-        pub fn set_paired_id_address(
+        pub fn write_paired_id_address(
             nvs: &mut EspNvs<NvsDefault>,
             address: BLEAddress,
         ) -> anyhow::Result<()> {
             nvs.set_blob("paired_id_address", &address.as_le_bytes())
                 .context("failed to set paired_id_address")
+        }
+    }
+
+    impl Config {
+        pub fn read_setup_finished(nvs: &EspNvs<NvsDefault>) -> anyhow::Result<Option<bool>> {
+            nvs.get_u8("setup_finished")
+                .map(|value| value.map(|v| v != 0))
+                .context("failed to get setup_finished")
+        }
+
+        pub fn write_setup_finished(
+            nvs: &mut EspNvs<NvsDefault>,
+            value: bool,
+        ) -> anyhow::Result<()> {
+            nvs.set_u8("setup_finished", value as u8)
+                .context("failed to set setup_finished")
         }
     }
 
@@ -88,7 +104,7 @@ mod bluetooth {
         server.on_connect(move |server, desc| {
             log::info!("new connection: {desc:?}");
 
-            let paired = Config::get_paired_id_address(&nvs.lock());
+            let paired = Config::read_paired_id_address(&nvs.lock());
             match paired {
                 Ok(Some(paired)) => {
                     if paired != desc.id_address() {
@@ -102,7 +118,7 @@ mod bluetooth {
                 }
                 Ok(None) => {
                     if let Err(error) =
-                        Config::set_paired_id_address(&mut nvs.lock(), desc.id_address())
+                        Config::write_paired_id_address(&mut nvs.lock(), desc.id_address())
                     {
                         log::error!("failed to set paired id address: {error:?}");
                     }
@@ -143,12 +159,46 @@ mod bluetooth {
         })
     }
 }
+mod movement {
+    use anyhow::{anyhow, Context};
+    use esp_idf_svc::hal::{
+        delay::Delay,
+        gpio::AnyIOPin,
+        i2c::{I2c, I2cConfig, I2cDriver},
+        peripheral::Peripheral,
+        units::{Hertz, KiloHertz},
+    };
+    use mpu6050::Mpu6050;
+
+    pub fn initialize<'d>(
+        i2c: impl Peripheral<P = impl I2c> + 'd,
+        sda: AnyIOPin,
+        scl: AnyIOPin,
+        baudrate: Hertz,
+    ) -> anyhow::Result<()> {
+        let config = I2cConfig::new().baudrate(baudrate);
+
+        log::info!("initializing i2c driver");
+        let driver =
+            I2cDriver::new(i2c, sda, scl, &config).context("failed to initialize i2c driver")?;
+
+        log::info!("initializing mpu6050");
+        let mut mpu6050 = Mpu6050::new(driver);
+
+        let mut delay = Delay::new_default();
+        mpu6050
+            .init(&mut delay)
+            .map_err(|e| anyhow!("failed to initialize mpu6050: {e:?}"))?;
+
+        Ok(())
+    }
+}
 
 use anyhow::Context;
 use esp32_nimble::utilities::mutex::Mutex;
-use esp_idf_svc::{
-    hal::prelude::Peripherals,
-    nvs::{EspNvs, EspNvsPartition, NvsDefault},
+use esp_idf_svc::hal::{
+    prelude::Peripherals,
+    units::{Hertz, KiloHertz},
 };
 use std::sync::Arc;
 
@@ -166,6 +216,18 @@ fn main() -> anyhow::Result<()> {
 
     log::info!("initializing bluetooth");
     let characteristics = bluetooth::initialize(nvs).context("failed to initialize bluetooth")?;
+
+    log::info!("initializing peripherals");
+    let peripherals = Peripherals::take().context("failed to take peripherals")?;
+
+    log::info!("initializing movement sensor");
+    let i2c = movement::initialize(
+        peripherals.i2c0,
+        peripherals.pins.gpio21.into(),
+        peripherals.pins.gpio22.into(),
+        KiloHertz(100).into(),
+    )
+    .context("failed to initialize movement sensor")?;
 
     Ok(())
 }
